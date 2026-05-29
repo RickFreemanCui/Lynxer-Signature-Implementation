@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Generate precomputed Frobenius powering matrices for Lynx OWF.
+
+Computes x -> x^(2^power) as GF(2) matrix-vector products in GF(2^N),
+and outputs a C++ header with compile-time constant arrays.
+
+Usage:
+    python3 tools/gen_frobenius_matrices.py > lynx_frobenius_consts.hpp
+"""
+
+import sys
+from typing import List, Tuple
+
+# Field polynomials from lynx_constants.hpp
+# The modulus represents the low-order bits: X^N + (these bits)
+FIELD_MODULI = {
+    192: 0x87,      # X^192 + X^7 + X^2 + X + 1
+    256: 0x425,     # X^256 + X^10 + X^5 + X^2 + 1
+    384: 0x18041,   # X^384 + X^16 + X^15 + X^6 + 1
+    512: 0x125,     # X^512 + X^8 + X^5 + X^2 + 1
+}
+
+# All (field_size, power) pairs needed in owf_proof.inc
+MATRICES = [
+    (192, 59),
+    (192, 13),
+    (256, 53),
+    (256, 5),
+    (384, 60),
+    (384, 30),
+    (384, 13),
+    (512, 180),
+    (512, 90),
+    (512, 6),
+    (512, 12),
+]
+
+
+def gf2n_square(x: int, n: int, modulus: int) -> int:
+    """Compute x^2 in GF(2^n) with reduction by the field polynomial."""
+    # Square in GF(2) = interleave bits with zeros (no cross terms in char 2)
+    # But for large n, it's simpler to use shift-and-reduce
+    result = 0
+    for i in range(n):
+        if (x >> i) & 1:
+            result ^= 1 << (2 * i)
+    # Reduce modulo the field polynomial X^n + modulus
+    for i in range(2 * n - 2, n - 1, -1):
+        if (result >> i) & 1:
+            result ^= modulus << (i - n)
+            result ^= 1 << i  # Clear the high bit (X^n term)
+    return result
+
+
+def gf2n_frobenius(x: int, n: int, power: int) -> int:
+    """Compute x^(2^power) in GF(2^n) via repeated squaring."""
+    modulus = FIELD_MODULI[n]
+    for _ in range(power):
+        x = gf2n_square(x, n, modulus)
+    return x
+
+
+def compute_frobenius_matrix(n: int, power: int) -> List[List[int]]:
+    """Compute the N x N GF(2) matrix for x -> x^(2^power).
+
+    Returns M where M[row][word] is a uint64_t, and the matrix-vector product
+    y = M*x computes y[row] = XOR of (M[row][col/64] >> (col%64)) & x_col.
+    """
+    w = (n + 63) // 64
+    # Initialize N rows, each with W uint64_t words
+    M = [[0] * w for _ in range(n)]
+
+    for col in range(n):
+        # Compute Frobenius of the col-th basis element (alpha^col = 1 << col)
+        basis = 1 << col
+        image = gf2n_frobenius(basis, n, power)
+
+        # Set bits in column col of each row
+        for row in range(n):
+            if (image >> row) & 1:
+                M[row][col // 64] |= 1 << (col % 64)
+
+    return M
+
+
+def format_uint64(v: int) -> str:
+    return f"UINT64_C(0x{v:016x})"
+
+
+def self_test():
+    """Verify a few known properties of Frobenius matrices."""
+    for n, modulus in FIELD_MODULI.items():
+        # Frobenius^0 should be identity
+        M_id = compute_frobenius_matrix(n, 0)
+        w = (n + 63) // 64
+        for row in range(n):
+            for word in range(w):
+                expected = 0
+                for col in range(min(64, n - word * 64)):
+                    actual_col = word * 64 + col
+                    if actual_col == row:
+                        expected |= 1 << col
+                assert M_id[row][word] == expected, (
+                    f"Identity check failed for GF(2^{n}), row={row}, word={word}"
+                )
+
+        # Frobenius^1 of element 2 (= alpha) should be alpha^2
+        val = gf2n_frobenius(2, n, 1)
+        assert val == 4, f"Frobenius^1(alpha) in GF(2^{n}) should be alpha^2, got {val}"
+
+        # Frobenius^n should be identity (x^(2^n) = x in GF(2^n))
+        for test_val in [1, 2, 3, (1 << (n - 1)) | 1]:
+            result = gf2n_frobenius(test_val, n, n)
+            assert result == test_val, (
+                f"Frobenius^{n}({test_val}) in GF(2^{n}) should be identity, got {result}"
+            )
+
+    # Verify matrix application matches direct computation for each matrix we generate
+    for n, power in MATRICES:
+        M = compute_frobenius_matrix(n, power)
+        w = (n + 63) // 64
+        # Test with a few values
+        for test_val in [1, 2, 3, (1 << (n // 2)) | 7, (1 << (n - 1)) | 1]:
+            expected = gf2n_frobenius(test_val, n, power)
+            # Apply matrix
+            inp_bits = [0] * w
+            for i in range(n):
+                if (test_val >> i) & 1:
+                    inp_bits[i // 64] |= 1 << (i % 64)
+            result = 0
+            for row in range(n):
+                acc = 0
+                for word in range(w):
+                    acc ^= M[row][word] & inp_bits[word]
+                bit = bin(acc).count('1') % 2
+                result |= bit << row
+            assert result == expected, (
+                f"Matrix check failed for GF(2^{n}), power={power}, "
+                f"input={test_val}: got {result}, expected {expected}"
+            )
+
+    print("All self-tests passed.", file=sys.stderr)
+
+
+def generate_header():
+    """Generate the C++ header file."""
+    lines = []
+    lines.append("// AUTO-GENERATED by tools/gen_frobenius_matrices.py — DO NOT EDIT")
+    lines.append("#ifndef LYNX_FROBENIUS_CONSTS_HPP")
+    lines.append("#define LYNX_FROBENIUS_CONSTS_HPP")
+    lines.append("")
+    lines.append("#include <array>")
+    lines.append("#include <cstdint>")
+    lines.append("#include <cstddef>")
+    lines.append("")
+    lines.append("namespace faest {")
+    lines.append("namespace lynx {")
+    lines.append("")
+
+    # Forward-declare the dispatch template
+    lines.append("template <std::size_t N, unsigned int power>")
+    lines.append("const std::array<std::array<uint64_t, (N+63)/64>, N>& lynx_frobenius_matrix_const();")
+    lines.append("")
+
+    # Generate each matrix
+    for n, power in MATRICES:
+        w = (n + 63) // 64
+        M = compute_frobenius_matrix(n, power)
+        name = f"frob{n}_{power}"
+
+        lines.append(f"inline const std::array<std::array<uint64_t, {w}>, {n}> {name} = {{{{")
+        for row in range(n):
+            words = ", ".join(format_uint64(M[row][j]) for j in range(w))
+            comma = "," if row < n - 1 else ""
+            lines.append(f"    {{{{{words}}}}}{comma}")
+        lines.append("}};")
+        lines.append("")
+
+    # Generate explicit specializations
+    for n, power in MATRICES:
+        name = f"frob{n}_{power}"
+        lines.append(f"template <> inline const std::array<std::array<uint64_t, {(n+63)//64}>, {n}>&")
+        lines.append(f"lynx_frobenius_matrix_const<{n}, {power}>() {{ return {name}; }}")
+        lines.append("")
+
+    lines.append("} // namespace lynx")
+    lines.append("} // namespace faest")
+    lines.append("")
+    lines.append("#endif // LYNX_FROBENIUS_CONSTS_HPP")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    self_test()
+    print(generate_header())
