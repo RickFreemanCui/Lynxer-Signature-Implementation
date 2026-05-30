@@ -1,10 +1,22 @@
 # Lynx Optimized Implementation
 
-This implementation is based on the `faest-arch-opt` repo (https://github.com/faest-sign/faest-arch-opt). 
+This implementation is based on the `faest-arch-opt` repo (https://github.com/faest-sign/faest-arch-opt).
+We forked from the commit `580e99883c2673991783bf8105f6150ecaea0757`.
 
 We introduced the new `lynx` one-way function and the corresponding quicksilver proof system. We also used the Karatsuba algorithm for GF(2^n) multiplication.
 
+Building dependencies is outlined in the `Dependencies` section of `README.md` in the top directory.
+After installing the dependencies, running 
+```bash
+bash ./scripts/benchmark-local.sh
+```
+will complete the compilation and benchmarking process (initial run requires network access
+to download `XKCP` and `Catch2`).
+The benchmark results will be recorded in the `reports/benchmarks/` folder.
+
 The following is the original FAEST README.
+
+```markdown
 
 # Platform Specific FAEST Implementation for x86-64 (With ISA Extensions)
 
@@ -102,3 +114,4 @@ Additionally, we plan to support also the following sets of extensions that the 
 use:
 - AVX2_VAES: The above, plus VAES and VPCLMULQDQ.
 - AVX512: The above, plus AVX512F and AVX512BW.
+```
